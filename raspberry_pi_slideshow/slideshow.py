@@ -1,163 +1,836 @@
 #!/usr/bin/env python3
-import io, json, os, sys, time
+
+import os
+import sys
+import json
+import time
+import hashlib
+import threading
+import tempfile
 from pathlib import Path
-import pygame
+from urllib.parse import urlparse
+
 import requests
+import pygame
 
-SOURCE=os.getenv('SOURCE','drive').lower()
-LAPTOP_IP=os.getenv('LAPTOP_IP','192.168.1.7')
-SERVER_URL=f"http://{LAPTOP_IP}:{os.getenv('SERVER_PORT','8000')}"
-DRIVE_FOLDER_ID=os.getenv('DRIVE_FOLDER_ID','').split('/folders/')[-1].split('?')[0].strip('/')
-DRIVE_CREDENTIALS=os.getenv('DRIVE_CREDENTIALS','/home/pi/image_receiver/credentials.json')
-DRIVE_TOKEN=os.getenv('DRIVE_TOKEN','/home/pi/image_receiver/token.json')
-IMAGE_FOLDER=Path(os.getenv('IMAGE_FOLDER','/home/pi/image_receiver/images'))
-SLIDE_DELAY=float(os.getenv('SLIDE_DELAY','5'))
-UPDATE_CHECK_INTERVAL=float(os.getenv('UPDATE_CHECK_INTERVAL','30'))
-EXTS=('.jpg','.jpeg','.png','.webp')
-SCOPES=['https://www.googleapis.com/auth/drive.readonly']
-MANIFEST=IMAGE_FOLDER/'.image_manifest.json'
 
-def log(*x): print(*x,flush=True)
-def safe(n): return os.path.basename(n).replace('/','_').replace('\\','_') or 'unnamed'
-def md5(p):
-    if not p.exists(): return None
-    import hashlib
-    h=hashlib.md5()
-    with p.open('rb') as f:
-        for c in iter(lambda:f.read(1024*1024),b''): h.update(c)
-    return h.hexdigest()
-def load_manifest():
-    try: return json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
-    except Exception: return {}
-def save_manifest(m):
-    t=MANIFEST.with_suffix('.tmp'); t.write_text(json.dumps(m,indent=2)); os.replace(t,MANIFEST)
+# ============================================================
+# Configuration
+# ============================================================
 
-def laptop_items():
-    r=requests.get(SERVER_URL+'/images',timeout=5,headers={'Cache-Control':'no-cache'}); r.raise_for_status()
-    data=r.json(); out={}
-    for x in data:
-        if isinstance(x,str): n=safe(x); meta={'name':n}
-        else: n=safe(str(x.get('name',''))); meta=dict(x); meta['name']=n
-        if n.lower().endswith(EXTS): out[n]=meta
-    return out
+API_URL = os.environ.get("API_URL")
+DEVICE_ID = os.environ.get("DEVICE_ID")
+DEVICE_KEY = os.environ.get("DEVICE_KEY")
 
-def download_url(name):
-    p=IMAGE_FOLDER/name; t=p.with_suffix(p.suffix+'.tmp'); p.parent.mkdir(parents=True,exist_ok=True)
-    try:
-        with requests.get(SERVER_URL+'/'+name,timeout=30,stream=True,headers={'Cache-Control':'no-cache'}) as r:
-            r.raise_for_status()
-            with t.open('wb') as f:
-                for c in r.iter_content(1024*1024):
-                    if c: f.write(c)
-        os.replace(t,p); return True
-    except Exception as e:
-        log('Laptop download error:',name,e); t.unlink(missing_ok=True); return False
+IMAGE_FOLDER = Path(
+    os.environ.get(
+        "IMAGE_FOLDER",
+        "/home/pi/image_receiver/images"
+    )
+)
 
-def drive_auth():
-    from google.auth.transport.requests import Request
-    from google.oauth2.credentials import Credentials
-    from google_auth_oauthlib.flow import InstalledAppFlow
-    from googleapiclient.discovery import build
-    creds=None
-    if os.path.exists(DRIVE_TOKEN): creds=Credentials.from_authorized_user_file(DRIVE_TOKEN,SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token: creds.refresh(Request())
-        else:
-            if not os.path.exists(DRIVE_CREDENTIALS): raise RuntimeError('Missing '+DRIVE_CREDENTIALS)
-            creds=InstalledAppFlow.from_client_secrets_file(DRIVE_CREDENTIALS,SCOPES).run_local_server(port=0)
-        Path(DRIVE_TOKEN).parent.mkdir(parents=True,exist_ok=True); Path(DRIVE_TOKEN).write_text(creds.to_json())
-    return build('drive','v3',credentials=creds,cache_discovery=False)
+MANIFEST_FILE = Path(
+    os.environ.get(
+        "MANIFEST_FILE",
+        "/home/pi/image_receiver/manifest.json"
+    )
+)
 
-def drive_items(service):
-    if not DRIVE_FOLDER_ID: raise RuntimeError('Set DRIVE_FOLDER_ID in slideshow.env')
-    out={}
-    def walk(fid,rel=''):
-        token=None
+SLIDE_DELAY = int(
+    os.environ.get("SLIDE_DELAY", "5")
+)
+
+DEFAULT_POLL_INTERVAL = int(
+    os.environ.get("DEFAULT_POLL_INTERVAL", "60")
+)
+
+
+# ============================================================
+# Validation
+# ============================================================
+
+if not API_URL:
+    print("ERROR: API_URL is not configured")
+    sys.exit(1)
+
+if not DEVICE_ID:
+    print("ERROR: DEVICE_ID is not configured")
+    sys.exit(1)
+
+if not DEVICE_KEY:
+    print("ERROR: DEVICE_KEY is not configured")
+    sys.exit(1)
+
+
+IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
+
+
+# ============================================================
+# Globals
+# ============================================================
+
+playlist_lock = threading.Lock()
+
+playlist = []
+
+stop_event = threading.Event()
+
+session = requests.Session()
+
+session.headers.update({
+    "X-Device-Id": DEVICE_ID,
+    "X-Device-Key": DEVICE_KEY,
+    "User-Agent": "RaspberryPi-DigitalSignage/1.0"
+})
+
+
+# ============================================================
+# Utility functions
+# ============================================================
+
+def calculate_md5(file_path):
+    """
+    Calculate MD5 without loading the entire image into memory.
+    """
+
+    md5 = hashlib.md5()
+
+    with open(file_path, "rb") as f:
         while True:
-            r=service.files().list(q=f"'{fid}' in parents and trashed=false",spaces='drive',pageSize=1000,pageToken=token,fields='nextPageToken,files(id,name,mimeType,size,md5Checksum,modifiedTime)').execute()
-            for x in r.get('files',[]):
-                n=safe(x['name'])
-                if x['mimeType']=='application/vnd.google-apps.folder': walk(x['id'],os.path.join(rel,n))
-                elif n.lower().endswith(EXTS): out[os.path.join(rel,n)] = x
-            token=r.get('nextPageToken')
-            if not token: break
-    walk(DRIVE_FOLDER_ID); return out
+            chunk = f.read(1024 * 1024)
 
-def download_drive(service,name,meta):
-    from googleapiclient.http import MediaIoBaseDownload
-    p=IMAGE_FOLDER/name; t=p.with_suffix(p.suffix+'.tmp'); p.parent.mkdir(parents=True,exist_ok=True)
+            if not chunk:
+                break
+
+            md5.update(chunk)
+
+    return md5.hexdigest()
+
+
+def load_manifest():
+    """
+    Load local manifest.
+    """
+
+    if not MANIFEST_FILE.exists():
+        return {}
+
     try:
-        req=service.files().get_media(fileId=meta['id'])
-        with t.open('wb') as f:
-            d=MediaIoBaseDownload(f,req,chunksize=10*1024*1024); done=False
-            while not done:
-                status,done=d.next_chunk()
-                if status: log(f"{name}: {status.progress()*100:.1f}%")
-        os.replace(t,p); return True
+        with open(MANIFEST_FILE, "r") as f:
+            data = json.load(f)
+
+        if isinstance(data, dict):
+            return data
+
     except Exception as e:
-        log('Drive download error:',name,e); t.unlink(missing_ok=True); return False
+        print(f"Manifest read failed: {e}")
 
-def sync_drive(service,manifest):
-    remote=drive_items(service); changed=False
-    for name,x in remote.items():
-        key=[x['id'],x.get('md5Checksum'),x.get('size'),x.get('modifiedTime')]
-        if (IMAGE_FOLDER/name).exists() and manifest.get(name,{}).get('key')==key: continue
-        log('New/changed:',name)
-        if download_drive(service,name,x): manifest[name]={'key':key,'md5':md5(IMAGE_FOLDER/name)}; changed=True
-    for name in list(manifest):
-        if name not in remote:
-            p=IMAGE_FOLDER/name; p.unlink(missing_ok=True); del manifest[name]; changed=True; log('Removed:',name)
-    if changed: save_manifest(manifest)
-    return sorted(remote,key=str.lower)
+    return {}
 
-def sync_laptop(manifest):
-    remote=laptop_items(); names=sorted(remote,key=str.lower); changed=False
-    for name,x in remote.items():
-        key=x.get('etag') or x.get('md5') or (x.get('size'),x.get('mtime'),x.get('modifiedTime'))
-        if (IMAGE_FOLDER/name).exists() and key is not None and manifest.get(name,{}).get('key')==key: continue
-        if (IMAGE_FOLDER/name).exists() and key is None and name in manifest: continue
-        log('Downloading:',name)
-        if download_url(name): manifest[name]={'key':key,'md5':md5(IMAGE_FOLDER/name)}; changed=True
-    for name in list(manifest):
-        if name not in remote: (IMAGE_FOLDER/name).unlink(missing_ok=True); del manifest[name]; changed=True; log('Removed:',name)
-    if changed: save_manifest(manifest)
-    return names
 
-IMAGE_FOLDER.mkdir(parents=True,exist_ok=True); manifest=load_manifest(); service=None
-if SOURCE=='drive':
-    try: service=drive_auth()
-    except Exception as e: log('Drive authentication unavailable:',e)
+def save_manifest(manifest):
+    """
+    Save manifest atomically.
+    """
 
-def sync():
-    global image_list
+    temp_file = MANIFEST_FILE.with_suffix(".tmp")
+
     try:
-        image_list=sync_drive(service,manifest) if SOURCE=='drive' and service else sync_laptop(manifest)
+        with open(temp_file, "w") as f:
+            json.dump(
+                manifest,
+                f,
+                indent=2
+            )
+
+        os.replace(temp_file, MANIFEST_FILE)
+
     except Exception as e:
-        log('Sync failed; keeping cached images:',e)
-        image_list=sorted([str(p.relative_to(IMAGE_FOLDER)) for p in IMAGE_FOLDER.rglob('*') if p.is_file() and p.suffix.lower() in EXTS],key=str.lower)
+        print(f"Manifest save failed: {e}")
 
-pygame.init(); screen=pygame.display.set_mode((0,0),pygame.FULLSCREEN); pygame.mouse.set_visible(False)
-W,H=screen.get_size(); log('Slideshow:',SOURCE,W,H); sync()
-idx=0; last_slide=time.time(); last_sync=0
+        try:
+            temp_file.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-def show(name):
-    p=IMAGE_FOLDER/name
-    if not p.exists(): return
+
+def get_file_extension(url):
+    """
+    Determine image extension from URL.
+    """
+
     try:
-        im=pygame.image.load(str(p)).convert(); iw,ih=im.get_size(); s=min(W/iw,H/ih); im=pygame.transform.smoothscale(im,(max(1,int(iw*s)),max(1,int(ih*s))))
-        screen.fill((0,0,0)); screen.blit(im,((W-im.get_width())//2,(H-im.get_height())//2)); pygame.display.flip(); log('Showing:',name)
-    except Exception as e: log('Display error:',name,e)
-if image_list: show(image_list[0])
-while True:
+        path = urlparse(url).path
+        extension = Path(path).suffix.lower()
+
+        if extension in [
+            ".jpg",
+            ".jpeg",
+            ".png",
+            ".webp"
+        ]:
+            return extension
+
+    except Exception:
+        pass
+
+    return ".jpg"
+
+
+# ============================================================
+# API
+# ============================================================
+
+def fetch_feed():
+    """
+    Fetch device feed from backend.
+    """
+
     try:
-        now=time.time()
-        for e in pygame.event.get():
-            if e.type==pygame.QUIT or (e.type==pygame.KEYDOWN and e.key==pygame.K_ESCAPE): raise KeyboardInterrupt
-        if now-last_sync>=UPDATE_CHECK_INTERVAL:
-            old=image_list[:]; sync(); last_sync=now
-            if image_list and image_list!=old: idx=min(idx,len(image_list)-1); show(image_list[idx]); last_slide=now
-        if image_list and now-last_slide>=SLIDE_DELAY:
-            idx=(idx+1)%len(image_list); show(image_list[idx]); last_slide=now
-        time.sleep(.05)
-    except KeyboardInterrupt: pygame.quit(); sys.exit(0)
-    except Exception as e: log('Loop error:',e); time.sleep(2)
+        response = session.get(
+            API_URL,
+            timeout=(5, 15)
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        if not data.get("status"):
+            print(
+                "API returned unsuccessful status:",
+                data.get("message")
+            )
+            return None, DEFAULT_POLL_INTERVAL
+
+        feed_data = data.get("data", {})
+
+        posters = feed_data.get("posters", [])
+
+        poll_interval = feed_data.get(
+            "pollIntervalSeconds",
+            DEFAULT_POLL_INTERVAL
+        )
+
+        try:
+            poll_interval = int(poll_interval)
+        except Exception:
+            poll_interval = DEFAULT_POLL_INTERVAL
+
+        if poll_interval < 5:
+            poll_interval = 5
+
+        return posters, poll_interval
+
+    except requests.RequestException as e:
+        print(f"API request failed: {e}")
+
+    except ValueError as e:
+        print(f"Invalid JSON response: {e}")
+
+    except Exception as e:
+        print(f"Feed error: {e}")
+
+    return None, DEFAULT_POLL_INTERVAL
+
+
+# ============================================================
+# Image download
+# ============================================================
+
+def download_image(url, destination):
+    """
+    Download image to destination.
+    """
+
+    temp_file = None
+
+    try:
+        with session.get(
+            url,
+            stream=True,
+            timeout=(5, 30)
+        ) as response:
+
+            response.raise_for_status()
+
+            with tempfile.NamedTemporaryFile(
+                dir=IMAGE_FOLDER,
+                prefix=".download_",
+                suffix=".tmp",
+                delete=False
+            ) as f:
+
+                temp_file = Path(f.name)
+
+                for chunk in response.iter_content(
+                    chunk_size=1024 * 1024
+                ):
+                    if chunk:
+                        f.write(chunk)
+
+        return temp_file
+
+    except Exception as e:
+        print(f"Image download failed: {url}")
+        print(f"Reason: {e}")
+
+        if temp_file:
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+        return None
+
+
+# ============================================================
+# Synchronization
+# ============================================================
+
+def synchronize_images(posters):
+    """
+    Synchronize API posters with local image cache.
+
+    MD5 is calculated locally because the API currently
+    doesn't provide an MD5 value.
+    """
+
+    manifest = load_manifest()
+
+    new_manifest = {}
+
+    new_playlist = []
+
+    active_ids = set()
+
+    for poster in posters:
+
+        poster_id = poster.get("_id")
+        image_url = poster.get("imageUrl")
+
+        if not poster_id or not image_url:
+            continue
+
+        # Only display active/non-deleted posters.
+        if poster.get("isDeleted", False):
+            continue
+
+        if not poster.get("isActive", True):
+            continue
+
+        active_ids.add(poster_id)
+
+        extension = get_file_extension(image_url)
+
+        filename = f"{poster_id}{extension}"
+
+        local_file = IMAGE_FOLDER / filename
+
+        old_entry = manifest.get(poster_id, {})
+
+        old_url = old_entry.get("url")
+        old_md5 = old_entry.get("md5")
+
+        needs_download = False
+
+        # ----------------------------------------------------
+        # First time poster
+        # ----------------------------------------------------
+
+        if not local_file.exists():
+            needs_download = True
+
+        # ----------------------------------------------------
+        # URL changed
+        # ----------------------------------------------------
+
+        elif old_url != image_url:
+            print(
+                f"[SYNC] URL changed: {poster_id}"
+            )
+            needs_download = True
+
+        # ----------------------------------------------------
+        # Manifest doesn't contain MD5
+        # ----------------------------------------------------
+
+        elif not old_md5:
+            print(
+                f"[SYNC] MD5 missing: {poster_id}"
+            )
+            needs_download = True
+
+        # ----------------------------------------------------
+        # Download and compare
+        # ----------------------------------------------------
+
+        if needs_download:
+
+            print(
+                f"[SYNC] Downloading: {poster_id}"
+            )
+
+            temp_file = download_image(
+                image_url,
+                local_file
+            )
+
+            if temp_file is None:
+
+                # If an old file exists, keep it.
+                if local_file.exists():
+
+                    print(
+                        f"[SYNC] Keeping existing image: "
+                        f"{poster_id}"
+                    )
+
+                    try:
+                        current_md5 = calculate_md5(
+                            local_file
+                        )
+                    except Exception:
+                        current_md5 = None
+
+                    new_manifest[poster_id] = {
+                        "url": image_url,
+                        "md5": current_md5,
+                        "file": filename
+                    }
+
+                    new_playlist.append(
+                        str(local_file)
+                    )
+
+                continue
+
+            try:
+                new_md5 = calculate_md5(temp_file)
+
+                # Compare with existing image.
+                if local_file.exists():
+
+                    try:
+                        current_md5 = calculate_md5(
+                            local_file
+                        )
+                    except Exception:
+                        current_md5 = None
+
+                    if (
+                        current_md5
+                        and current_md5 == new_md5
+                    ):
+                        print(
+                            f"[SYNC] Unchanged: "
+                            f"{poster_id}"
+                        )
+
+                        temp_file.unlink(
+                            missing_ok=True
+                        )
+
+                    else:
+                        print(
+                            f"[SYNC] Updated: "
+                            f"{poster_id}"
+                        )
+
+                        os.replace(
+                            temp_file,
+                            local_file
+                        )
+
+                else:
+
+                    print(
+                        f"[SYNC] Added: "
+                        f"{poster_id}"
+                    )
+
+                    os.replace(
+                        temp_file,
+                        local_file
+                    )
+
+                new_manifest[poster_id] = {
+                    "url": image_url,
+                    "md5": new_md5,
+                    "file": filename
+                }
+
+                new_playlist.append(
+                    str(local_file)
+                )
+
+            except Exception as e:
+
+                print(
+                    f"[SYNC] Failed processing "
+                    f"{poster_id}: {e}"
+                )
+
+                try:
+                    temp_file.unlink(
+                        missing_ok=True
+                    )
+                except Exception:
+                    pass
+
+        else:
+
+            # Existing image hasn't changed according
+            # to our local manifest.
+            new_manifest[poster_id] = {
+                "url": image_url,
+                "md5": old_md5,
+                "file": filename
+            }
+
+            new_playlist.append(
+                str(local_file)
+            )
+
+    # ========================================================
+    # Remove posters no longer returned by API
+    # ========================================================
+
+    for poster_id, entry in manifest.items():
+
+        if poster_id in active_ids:
+            continue
+
+        filename = entry.get("file")
+
+        if filename:
+
+            old_file = IMAGE_FOLDER / filename
+
+            try:
+                if old_file.exists():
+                    old_file.unlink()
+
+                    print(
+                        f"[SYNC] Removed: "
+                        f"{poster_id}"
+                    )
+
+            except Exception as e:
+                print(
+                    f"[SYNC] Could not remove "
+                    f"{old_file}: {e}"
+                )
+
+    # ========================================================
+    # Save manifest
+    # ========================================================
+
+    save_manifest(new_manifest)
+
+    # ========================================================
+    # Update playlist atomically
+    # ========================================================
+
+    with playlist_lock:
+        playlist.clear()
+        playlist.extend(new_playlist)
+
+    print(
+        f"[SYNC] Synchronization complete. "
+        f"{len(new_playlist)} images available."
+    )
+
+
+# ============================================================
+# Background synchronization thread
+# ============================================================
+
+def sync_worker():
+
+    print("[SYNC] Background synchronization started")
+
+    poll_interval = DEFAULT_POLL_INTERVAL
+
+    while not stop_event.is_set():
+
+        posters, api_interval = fetch_feed()
+
+        if posters is not None:
+
+            try:
+                synchronize_images(posters)
+
+                poll_interval = api_interval
+
+            except Exception as e:
+
+                print(
+                    f"[SYNC] Synchronization error: {e}"
+                )
+
+        else:
+
+            print(
+                "[SYNC] API unavailable. "
+                "Keeping cached images."
+            )
+
+        print(
+            f"[SYNC] Next check in "
+            f"{poll_interval} seconds"
+        )
+
+        stop_event.wait(poll_interval)
+
+
+# ============================================================
+# Playlist
+# ============================================================
+
+def get_playlist():
+
+    with playlist_lock:
+        return list(playlist)
+
+
+def load_existing_cache():
+
+    """
+    If the Pi starts without network access,
+    use previously downloaded images.
+    """
+
+    manifest = load_manifest()
+
+    cached = []
+
+    for poster_id, entry in manifest.items():
+
+        filename = entry.get("file")
+
+        if not filename:
+            continue
+
+        file_path = IMAGE_FOLDER / filename
+
+        if file_path.exists():
+            cached.append(str(file_path))
+
+    with playlist_lock:
+        playlist.clear()
+        playlist.extend(cached)
+
+    print(
+        f"[CACHE] Loaded {len(cached)} cached images"
+    )
+
+
+# ============================================================
+# Pygame
+# ============================================================
+
+def show_image(screen, image_path):
+
+    try:
+
+        image = pygame.image.load(
+            image_path
+        ).convert()
+
+        screen_width, screen_height = (
+            screen.get_size()
+        )
+
+        image_width, image_height = (
+            image.get_size()
+        )
+
+        scale = min(
+            screen_width / image_width,
+            screen_height / image_height
+        )
+
+        new_width = int(
+            image_width * scale
+        )
+
+        new_height = int(
+            image_height * scale
+        )
+
+        image = pygame.transform.smoothscale(
+            image,
+            (
+                new_width,
+                new_height
+            )
+        )
+
+        screen.fill((0, 0, 0))
+
+        x = (
+            screen_width - new_width
+        ) // 2
+
+        y = (
+            screen_height - new_height
+        ) // 2
+
+        screen.blit(
+            image,
+            (x, y)
+        )
+
+        pygame.display.flip()
+
+    except Exception as e:
+
+        print(
+            f"[DISPLAY] Failed to display "
+            f"{image_path}: {e}"
+        )
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main():
+
+    print("===================================")
+    print(" Raspberry Pi Digital Signage")
+    print("===================================")
+    print(f"Device ID : {DEVICE_ID}")
+    print(f"API       : {API_URL}")
+    print(f"Images    : {IMAGE_FOLDER}")
+    print(f"Slide     : {SLIDE_DELAY} seconds")
+    print("===================================")
+
+    # Load old images first.
+    load_existing_cache()
+
+    # Start background API synchronization.
+    sync_thread = threading.Thread(
+        target=sync_worker,
+        daemon=True
+    )
+
+    sync_thread.start()
+
+    # Initialize pygame.
+    pygame.init()
+
+    info = pygame.display.Info()
+
+    print(
+        f"Slideshow: drive "
+        f"{info.current_w} x {info.current_h}"
+    )
+
+    screen = pygame.display.set_mode(
+        (0, 0),
+        pygame.FULLSCREEN
+    )
+
+    pygame.mouse.set_visible(False)
+
+    clock = pygame.time.Clock()
+
+    current_index = 0
+    last_change = 0
+
+    running = True
+
+    while running:
+
+        # ----------------------------------------------------
+        # Handle pygame events
+        # ----------------------------------------------------
+
+        for event in pygame.event.get():
+
+            if event.type == pygame.QUIT:
+                running = False
+
+            elif event.type == pygame.KEYDOWN:
+
+                if event.key == pygame.K_ESCAPE:
+                    running = False
+
+        # ----------------------------------------------------
+        # Get current playlist
+        # ----------------------------------------------------
+
+        images = get_playlist()
+
+        if images:
+
+            # Prevent index going out of range after
+            # synchronization changes the playlist.
+            if current_index >= len(images):
+                current_index = 0
+
+            now = time.monotonic()
+
+            if (
+                last_change == 0
+                or now - last_change >= SLIDE_DELAY
+            ):
+
+                image_path = images[current_index]
+
+                print(
+                    f"[DISPLAY] "
+                    f"{current_index + 1}/"
+                    f"{len(images)} "
+                    f"{image_path}"
+                )
+
+                show_image(
+                    screen,
+                    image_path
+                )
+
+                current_index = (
+                    current_index + 1
+                ) % len(images)
+
+                last_change = now
+
+        else:
+
+            # No images available.
+            screen.fill((0, 0, 0))
+
+            pygame.display.flip()
+
+            last_change = time.monotonic()
+
+        clock.tick(10)
+
+    # --------------------------------------------------------
+    # Shutdown
+    # --------------------------------------------------------
+
+    print("Stopping slideshow...")
+
+    stop_event.set()
+
+    sync_thread.join(timeout=2)
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+
+    try:
+        main()
+
+    except KeyboardInterrupt:
+
+        print("\nInterrupted")
+
+        stop_event.set()
+
+        pygame.quit()
