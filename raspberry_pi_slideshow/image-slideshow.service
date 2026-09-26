@@ -1,0 +1,19 @@
+[Unit]
+Description=Raspberry Pi Image Slideshow
+After=graphical.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi/image_receiver
+EnvironmentFile=/home/pi/image_receiver/slideshow.env
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+ExecStart=/usr/bin/python3 /home/pi/image_receiver/slideshow.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=graphical.target
