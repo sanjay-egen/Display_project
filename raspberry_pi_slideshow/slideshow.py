@@ -1,836 +1,386 @@
 #!/usr/bin/env python3
-
-import os
-import sys
-import json
-import time
-import hashlib
-import threading
-import tempfile
+import os, sys, json, time, uuid, hashlib, threading, tempfile
 from pathlib import Path
+from datetime import datetime, timezone
+from queue import Queue, Empty
 from urllib.parse import urlparse
 
 import requests
 import pygame
 
-
-# ============================================================
-# Configuration
-# ============================================================
-
 API_URL = os.environ.get("API_URL")
+ANALYTICS_URL = os.environ.get("ANALYTICS_URL")
 DEVICE_ID = os.environ.get("DEVICE_ID")
 DEVICE_KEY = os.environ.get("DEVICE_KEY")
+IMAGE_FOLDER = Path(os.environ.get("IMAGE_FOLDER", "/home/pi/image_receiver/images"))
+MANIFEST_FILE = Path(os.environ.get("MANIFEST_FILE", "/home/pi/image_receiver/manifest.json"))
+ANALYTICS_QUEUE_FILE = Path(os.environ.get("ANALYTICS_QUEUE_FILE", "/home/pi/image_receiver/analytics_queue.json"))
+SLIDE_DELAY = float(os.environ.get("SLIDE_DELAY", "5"))
+DEFAULT_POLL_INTERVAL = int(os.environ.get("DEFAULT_POLL_INTERVAL", "60"))
+ANALYTICS_RETRY_SECONDS = int(os.environ.get("ANALYTICS_RETRY_SECONDS", "10"))
 
-IMAGE_FOLDER = Path(
-    os.environ.get(
-        "IMAGE_FOLDER",
-        "/home/pi/image_receiver/images"
-    )
-)
-
-MANIFEST_FILE = Path(
-    os.environ.get(
-        "MANIFEST_FILE",
-        "/home/pi/image_receiver/manifest.json"
-    )
-)
-
-SLIDE_DELAY = int(
-    os.environ.get("SLIDE_DELAY", "5")
-)
-
-DEFAULT_POLL_INTERVAL = int(
-    os.environ.get("DEFAULT_POLL_INTERVAL", "60")
-)
-
-
-# ============================================================
-# Validation
-# ============================================================
-
-if not API_URL:
-    print("ERROR: API_URL is not configured")
+missing = [k for k, v in {
+    "API_URL": API_URL, "ANALYTICS_URL": ANALYTICS_URL,
+    "DEVICE_ID": DEVICE_ID, "DEVICE_KEY": DEVICE_KEY
+}.items() if not v]
+if missing:
+    print("ERROR: Missing configuration: " + ", ".join(missing))
     sys.exit(1)
-
-if not DEVICE_ID:
-    print("ERROR: DEVICE_ID is not configured")
-    sys.exit(1)
-
-if not DEVICE_KEY:
-    print("ERROR: DEVICE_KEY is not configured")
-    sys.exit(1)
-
 
 IMAGE_FOLDER.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# Globals
-# ============================================================
-
 playlist_lock = threading.Lock()
-
 playlist = []
-
 stop_event = threading.Event()
+analytics_queue = Queue()
+analytics_file_lock = threading.Lock()
 
 session = requests.Session()
-
 session.headers.update({
     "X-Device-Id": DEVICE_ID,
     "X-Device-Key": DEVICE_KEY,
     "User-Agent": "RaspberryPi-DigitalSignage/1.0"
 })
 
+def calculate_md5(path):
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-# ============================================================
-# Utility functions
-# ============================================================
+def load_json(path, default):
+    if not path.exists():
+        return default
+    try:
+        with open(path) as f:
+            value = json.load(f)
+        return value
+    except Exception as e:
+        print(f"[FILE] Read failed {path}: {e}")
+        return default
 
-def calculate_md5(file_path):
-    """
-    Calculate MD5 without loading the entire image into memory.
-    """
-
-    md5 = hashlib.md5()
-
-    with open(file_path, "rb") as f:
-        while True:
-            chunk = f.read(1024 * 1024)
-
-            if not chunk:
-                break
-
-            md5.update(chunk)
-
-    return md5.hexdigest()
-
+def save_json_atomic(path, value):
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with open(tmp, "w") as f:
+            json.dump(value, f, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[FILE] Save failed {path}: {e}")
+        try: tmp.unlink(missing_ok=True)
+        except Exception: pass
 
 def load_manifest():
-    """
-    Load local manifest.
-    """
+    data = load_json(MANIFEST_FILE, {})
+    return data if isinstance(data, dict) else {}
 
-    if not MANIFEST_FILE.exists():
-        return {}
+def save_manifest(data):
+    save_json_atomic(MANIFEST_FILE, data)
 
+def utc_iso(dt=None):
+    dt = dt or datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
+
+def get_extension(url):
     try:
-        with open(MANIFEST_FILE, "r") as f:
-            data = json.load(f)
-
-        if isinstance(data, dict):
-            return data
-
-    except Exception as e:
-        print(f"Manifest read failed: {e}")
-
-    return {}
-
-
-def save_manifest(manifest):
-    """
-    Save manifest atomically.
-    """
-
-    temp_file = MANIFEST_FILE.with_suffix(".tmp")
-
-    try:
-        with open(temp_file, "w") as f:
-            json.dump(
-                manifest,
-                f,
-                indent=2
-            )
-
-        os.replace(temp_file, MANIFEST_FILE)
-
-    except Exception as e:
-        print(f"Manifest save failed: {e}")
-
-        try:
-            temp_file.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-
-def get_file_extension(url):
-    """
-    Determine image extension from URL.
-    """
-
-    try:
-        path = urlparse(url).path
-        extension = Path(path).suffix.lower()
-
-        if extension in [
-            ".jpg",
-            ".jpeg",
-            ".png",
-            ".webp"
-        ]:
-            return extension
-
+        ext = Path(urlparse(url).path).suffix.lower()
+        if ext in (".jpg", ".jpeg", ".png", ".webp"):
+            return ext
     except Exception:
         pass
-
     return ".jpg"
 
-
-# ============================================================
-# API
-# ============================================================
-
 def fetch_feed():
-    """
-    Fetch device feed from backend.
-    """
-
     try:
-        response = session.get(
-            API_URL,
-            timeout=(5, 15)
-        )
-
-        response.raise_for_status()
-
-        data = response.json()
-
-        if not data.get("status"):
-            print(
-                "API returned unsuccessful status:",
-                data.get("message")
-            )
+        r = session.get(API_URL, timeout=(5, 15))
+        r.raise_for_status()
+        payload = r.json()
+        if not payload.get("status"):
+            print(f"[FEED] API failure: {payload.get('message')}")
             return None, DEFAULT_POLL_INTERVAL
-
-        feed_data = data.get("data", {})
-
-        posters = feed_data.get("posters", [])
-
-        poll_interval = feed_data.get(
-            "pollIntervalSeconds",
-            DEFAULT_POLL_INTERVAL
-        )
-
+        data = payload.get("data", {})
+        posters = data.get("posters", [])
         try:
-            poll_interval = int(poll_interval)
+            interval = max(5, int(data.get("pollIntervalSeconds", DEFAULT_POLL_INTERVAL)))
         except Exception:
-            poll_interval = DEFAULT_POLL_INTERVAL
-
-        if poll_interval < 5:
-            poll_interval = 5
-
-        return posters, poll_interval
-
+            interval = DEFAULT_POLL_INTERVAL
+        return posters, interval
     except requests.RequestException as e:
-        print(f"API request failed: {e}")
-
+        print(f"[FEED] Request failed: {e}")
     except ValueError as e:
-        print(f"Invalid JSON response: {e}")
-
+        print(f"[FEED] Invalid JSON: {e}")
     except Exception as e:
-        print(f"Feed error: {e}")
-
+        print(f"[FEED] Error: {e}")
     return None, DEFAULT_POLL_INTERVAL
 
-
-# ============================================================
-# Image download
-# ============================================================
-
-def download_image(url, destination):
-    """
-    Download image to destination.
-    """
-
-    temp_file = None
-
+def download_image(url):
+    tmp = None
     try:
-        with session.get(
-            url,
-            stream=True,
-            timeout=(5, 30)
-        ) as response:
-
-            response.raise_for_status()
-
+        with session.get(url, stream=True, timeout=(5, 30)) as r:
+            r.raise_for_status()
             with tempfile.NamedTemporaryFile(
-                dir=IMAGE_FOLDER,
-                prefix=".download_",
-                suffix=".tmp",
-                delete=False
+                dir=IMAGE_FOLDER, prefix=".download_", suffix=".tmp", delete=False
             ) as f:
-
-                temp_file = Path(f.name)
-
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 1024
-                ):
+                tmp = Path(f.name)
+                for chunk in r.iter_content(1024 * 1024):
                     if chunk:
                         f.write(chunk)
-
-        return temp_file
-
+        return tmp
     except Exception as e:
-        print(f"Image download failed: {url}")
-        print(f"Reason: {e}")
-
-        if temp_file:
-            try:
-                temp_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+        print(f"[IMAGE] Download failed: {e}")
+        if tmp:
+            try: tmp.unlink(missing_ok=True)
+            except Exception: pass
         return None
 
-
-# ============================================================
-# Synchronization
-# ============================================================
-
 def synchronize_images(posters):
-    """
-    Synchronize API posters with local image cache.
-
-    MD5 is calculated locally because the API currently
-    doesn't provide an MD5 value.
-    """
-
     manifest = load_manifest()
-
     new_manifest = {}
-
     new_playlist = []
-
     active_ids = set()
 
     for poster in posters:
-
+        # poster_id is exactly poster["_id"] from the feed.
         poster_id = poster.get("_id")
         image_url = poster.get("imageUrl")
-
         if not poster_id or not image_url:
             continue
-
-        # Only display active/non-deleted posters.
-        if poster.get("isDeleted", False):
-            continue
-
-        if not poster.get("isActive", True):
+        if poster.get("isDeleted", False) or not poster.get("isActive", True):
             continue
 
         active_ids.add(poster_id)
-
-        extension = get_file_extension(image_url)
-
-        filename = f"{poster_id}{extension}"
-
+        filename = f"{poster_id}{get_extension(image_url)}"
         local_file = IMAGE_FOLDER / filename
-
-        old_entry = manifest.get(poster_id, {})
-
-        old_url = old_entry.get("url")
-        old_md5 = old_entry.get("md5")
-
-        needs_download = False
-
-        # ----------------------------------------------------
-        # First time poster
-        # ----------------------------------------------------
-
-        if not local_file.exists():
-            needs_download = True
-
-        # ----------------------------------------------------
-        # URL changed
-        # ----------------------------------------------------
-
-        elif old_url != image_url:
-            print(
-                f"[SYNC] URL changed: {poster_id}"
-            )
-            needs_download = True
-
-        # ----------------------------------------------------
-        # Manifest doesn't contain MD5
-        # ----------------------------------------------------
-
-        elif not old_md5:
-            print(
-                f"[SYNC] MD5 missing: {poster_id}"
-            )
-            needs_download = True
-
-        # ----------------------------------------------------
-        # Download and compare
-        # ----------------------------------------------------
+        old = manifest.get(poster_id, {})
+        needs_download = (
+            not local_file.exists()
+            or old.get("url") != image_url
+            or not old.get("md5")
+        )
 
         if needs_download:
-
-            print(
-                f"[SYNC] Downloading: {poster_id}"
-            )
-
-            temp_file = download_image(
-                image_url,
-                local_file
-            )
-
-            if temp_file is None:
-
-                # If an old file exists, keep it.
+            print(f"[SYNC] Checking {poster_id}")
+            tmp = download_image(image_url)
+            if tmp is None:
                 if local_file.exists():
-
-                    print(
-                        f"[SYNC] Keeping existing image: "
-                        f"{poster_id}"
-                    )
-
-                    try:
-                        current_md5 = calculate_md5(
-                            local_file
-                        )
-                    except Exception:
-                        current_md5 = None
-
-                    new_manifest[poster_id] = {
-                        "url": image_url,
-                        "md5": current_md5,
-                        "file": filename
-                    }
-
-                    new_playlist.append(
-                        str(local_file)
-                    )
-
+                    md5 = calculate_md5(local_file)
+                    new_manifest[poster_id] = {"url": image_url, "md5": md5, "file": filename}
+                    new_playlist.append({"posterId": poster_id, "file": str(local_file)})
                 continue
 
             try:
-                new_md5 = calculate_md5(temp_file)
-
-                # Compare with existing image.
-                if local_file.exists():
-
-                    try:
-                        current_md5 = calculate_md5(
-                            local_file
-                        )
-                    except Exception:
-                        current_md5 = None
-
-                    if (
-                        current_md5
-                        and current_md5 == new_md5
-                    ):
-                        print(
-                            f"[SYNC] Unchanged: "
-                            f"{poster_id}"
-                        )
-
-                        temp_file.unlink(
-                            missing_ok=True
-                        )
-
-                    else:
-                        print(
-                            f"[SYNC] Updated: "
-                            f"{poster_id}"
-                        )
-
-                        os.replace(
-                            temp_file,
-                            local_file
-                        )
-
+                new_md5 = calculate_md5(tmp)
+                current_md5 = calculate_md5(local_file) if local_file.exists() else None
+                if current_md5 == new_md5:
+                    print(f"[SYNC] Unchanged {poster_id}")
+                    tmp.unlink(missing_ok=True)
                 else:
-
-                    print(
-                        f"[SYNC] Added: "
-                        f"{poster_id}"
-                    )
-
-                    os.replace(
-                        temp_file,
-                        local_file
-                    )
-
-                new_manifest[poster_id] = {
-                    "url": image_url,
-                    "md5": new_md5,
-                    "file": filename
-                }
-
-                new_playlist.append(
-                    str(local_file)
-                )
-
+                    print(f"[SYNC] {'Updated' if local_file.exists() else 'Added'} {poster_id}")
+                    os.replace(tmp, local_file)
+                new_manifest[poster_id] = {"url": image_url, "md5": new_md5, "file": filename}
+                new_playlist.append({"posterId": poster_id, "file": str(local_file)})
             except Exception as e:
-
-                print(
-                    f"[SYNC] Failed processing "
-                    f"{poster_id}: {e}"
-                )
-
-                try:
-                    temp_file.unlink(
-                        missing_ok=True
-                    )
-                except Exception:
-                    pass
-
+                print(f"[SYNC] Processing failed for {poster_id}: {e}")
+                try: tmp.unlink(missing_ok=True)
+                except Exception: pass
         else:
-
-            # Existing image hasn't changed according
-            # to our local manifest.
-            new_manifest[poster_id] = {
-                "url": image_url,
-                "md5": old_md5,
-                "file": filename
-            }
-
-            new_playlist.append(
-                str(local_file)
-            )
-
-    # ========================================================
-    # Remove posters no longer returned by API
-    # ========================================================
+            new_manifest[poster_id] = {"url": image_url, "md5": old["md5"], "file": filename}
+            new_playlist.append({"posterId": poster_id, "file": str(local_file)})
 
     for poster_id, entry in manifest.items():
-
         if poster_id in active_ids:
             continue
-
         filename = entry.get("file")
-
         if filename:
-
             old_file = IMAGE_FOLDER / filename
-
             try:
                 if old_file.exists():
                     old_file.unlink()
-
-                    print(
-                        f"[SYNC] Removed: "
-                        f"{poster_id}"
-                    )
-
+                    print(f"[SYNC] Removed {poster_id}")
             except Exception as e:
-                print(
-                    f"[SYNC] Could not remove "
-                    f"{old_file}: {e}"
-                )
-
-    # ========================================================
-    # Save manifest
-    # ========================================================
+                print(f"[SYNC] Remove failed {old_file}: {e}")
 
     save_manifest(new_manifest)
-
-    # ========================================================
-    # Update playlist atomically
-    # ========================================================
-
     with playlist_lock:
-        playlist.clear()
-        playlist.extend(new_playlist)
-
-    print(
-        f"[SYNC] Synchronization complete. "
-        f"{len(new_playlist)} images available."
-    )
-
-
-# ============================================================
-# Background synchronization thread
-# ============================================================
+        playlist[:] = new_playlist
+    print(f"[SYNC] Complete: {len(new_playlist)} image(s)")
 
 def sync_worker():
-
-    print("[SYNC] Background synchronization started")
-
-    poll_interval = DEFAULT_POLL_INTERVAL
-
+    interval = DEFAULT_POLL_INTERVAL
     while not stop_event.is_set():
-
         posters, api_interval = fetch_feed()
-
         if posters is not None:
-
             try:
                 synchronize_images(posters)
-
-                poll_interval = api_interval
-
+                interval = api_interval
             except Exception as e:
-
-                print(
-                    f"[SYNC] Synchronization error: {e}"
-                )
-
+                print(f"[SYNC] Error: {e}")
         else:
+            print("[SYNC] Feed unavailable; keeping cache")
+        stop_event.wait(interval)
 
-            print(
-                "[SYNC] API unavailable. "
-                "Keeping cached images."
-            )
+def load_analytics_queue():
+    data = load_json(ANALYTICS_QUEUE_FILE, [])
+    return data if isinstance(data, list) else []
 
-        print(
-            f"[SYNC] Next check in "
-            f"{poll_interval} seconds"
-        )
+def save_analytics_queue(events):
+    save_json_atomic(ANALYTICS_QUEUE_FILE, events)
 
-        stop_event.wait(poll_interval)
+def enqueue_analytics(event):
+    with analytics_file_lock:
+        events = load_analytics_queue()
+        events.append(event)
+        save_analytics_queue(events)
+    analytics_queue.put(True)
 
+def post_analytics(event):
+    try:
+        r = session.post(ANALYTICS_URL, json=event, timeout=(5, 15))
+        if 200 <= r.status_code < 300:
+            print(f"[ANALYTICS] Sent {event['posterId']} {event['durationMs']}ms")
+            return True
+        print(f"[ANALYTICS] HTTP {r.status_code}: {r.text[:200]}")
+    except Exception as e:
+        print(f"[ANALYTICS] Failed: {e}")
+    return False
 
-# ============================================================
-# Playlist
-# ============================================================
+def analytics_worker():
+    with analytics_file_lock:
+        pending = load_analytics_queue()
+    for _ in pending:
+        analytics_queue.put(True)
+
+    while not stop_event.is_set():
+        try:
+            analytics_queue.get(timeout=1)
+        except Empty:
+            continue
+
+        while not stop_event.is_set():
+            with analytics_file_lock:
+                events = load_analytics_queue()
+            if not events:
+                break
+            event = events[0]
+            if post_analytics(event):
+                with analytics_file_lock:
+                    current = load_analytics_queue()
+                    if current:
+                        current.pop(0)
+                    save_analytics_queue(current)
+            else:
+                stop_event.wait(ANALYTICS_RETRY_SECONDS)
+                break
+
+def load_existing_cache():
+    manifest = load_manifest()
+    cached = []
+    for poster_id, entry in manifest.items():
+        filename = entry.get("file")
+        if filename and (IMAGE_FOLDER / filename).exists():
+            cached.append({"posterId": poster_id, "file": str(IMAGE_FOLDER / filename)})
+    with playlist_lock:
+        playlist[:] = cached
+    print(f"[CACHE] Loaded {len(cached)} cached image(s)")
 
 def get_playlist():
-
     with playlist_lock:
         return list(playlist)
 
-
-def load_existing_cache():
-
-    """
-    If the Pi starts without network access,
-    use previously downloaded images.
-    """
-
-    manifest = load_manifest()
-
-    cached = []
-
-    for poster_id, entry in manifest.items():
-
-        filename = entry.get("file")
-
-        if not filename:
-            continue
-
-        file_path = IMAGE_FOLDER / filename
-
-        if file_path.exists():
-            cached.append(str(file_path))
-
-    with playlist_lock:
-        playlist.clear()
-        playlist.extend(cached)
-
-    print(
-        f"[CACHE] Loaded {len(cached)} cached images"
-    )
-
-
-# ============================================================
-# Pygame
-# ============================================================
-
 def show_image(screen, image_path):
-
     try:
-
-        image = pygame.image.load(
-            image_path
-        ).convert()
-
-        screen_width, screen_height = (
-            screen.get_size()
-        )
-
-        image_width, image_height = (
-            image.get_size()
-        )
-
-        scale = min(
-            screen_width / image_width,
-            screen_height / image_height
-        )
-
-        new_width = int(
-            image_width * scale
-        )
-
-        new_height = int(
-            image_height * scale
-        )
-
-        image = pygame.transform.smoothscale(
-            image,
-            (
-                new_width,
-                new_height
-            )
-        )
-
+        image = pygame.image.load(image_path).convert()
+        sw, sh = screen.get_size()
+        iw, ih = image.get_size()
+        scale = min(sw / iw, sh / ih)
+        image = pygame.transform.smoothscale(image, (max(1, int(iw * scale)), max(1, int(ih * scale))))
         screen.fill((0, 0, 0))
-
-        x = (
-            screen_width - new_width
-        ) // 2
-
-        y = (
-            screen_height - new_height
-        ) // 2
-
-        screen.blit(
-            image,
-            (x, y)
-        )
-
+        screen.blit(image, ((sw - image.get_width()) // 2, (sh - image.get_height()) // 2))
         pygame.display.flip()
-
+        return True
     except Exception as e:
-
-        print(
-            f"[DISPLAY] Failed to display "
-            f"{image_path}: {e}"
-        )
-
-
-# ============================================================
-# Main
-# ============================================================
+        print(f"[DISPLAY] Failed {image_path}: {e}")
+        return False
 
 def main():
-
-    print("===================================")
+    print("======================================")
     print(" Raspberry Pi Digital Signage")
-    print("===================================")
+    print("======================================")
     print(f"Device ID : {DEVICE_ID}")
-    print(f"API       : {API_URL}")
+    print(f"Feed API  : {API_URL}")
+    print(f"Analytics : {ANALYTICS_URL}")
     print(f"Images    : {IMAGE_FOLDER}")
-    print(f"Slide     : {SLIDE_DELAY} seconds")
-    print("===================================")
+    print(f"Slide     : {SLIDE_DELAY}s")
+    print("======================================")
 
-    # Load old images first.
     load_existing_cache()
 
-    # Start background API synchronization.
-    sync_thread = threading.Thread(
-        target=sync_worker,
-        daemon=True
-    )
+    threading.Thread(target=sync_worker, daemon=True, name="FeedSync").start()
+    threading.Thread(target=analytics_worker, daemon=True, name="Analytics").start()
 
-    sync_thread.start()
-
-    # Initialize pygame.
     pygame.init()
-
     info = pygame.display.Info()
-
-    print(
-        f"Slideshow: drive "
-        f"{info.current_w} x {info.current_h}"
-    )
-
-    screen = pygame.display.set_mode(
-        (0, 0),
-        pygame.FULLSCREEN
-    )
-
+    print(f"[DISPLAY] {info.current_w} x {info.current_h}")
+    screen = pygame.display.set_mode((0, 0), pygame.FULLSCREEN)
     pygame.mouse.set_visible(False)
-
     clock = pygame.time.Clock()
 
     current_index = 0
-    last_change = 0
-
     running = True
 
     while running:
-
-        # ----------------------------------------------------
-        # Handle pygame events
-        # ----------------------------------------------------
-
         for event in pygame.event.get():
-
-            if event.type == pygame.QUIT:
+            if event.type == pygame.QUIT or (
+                event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+            ):
                 running = False
 
-            elif event.type == pygame.KEYDOWN:
-
-                if event.key == pygame.K_ESCAPE:
-                    running = False
-
-        # ----------------------------------------------------
-        # Get current playlist
-        # ----------------------------------------------------
-
         images = get_playlist()
-
-        if images:
-
-            # Prevent index going out of range after
-            # synchronization changes the playlist.
-            if current_index >= len(images):
-                current_index = 0
-
-            now = time.monotonic()
-
-            if (
-                last_change == 0
-                or now - last_change >= SLIDE_DELAY
-            ):
-
-                image_path = images[current_index]
-
-                print(
-                    f"[DISPLAY] "
-                    f"{current_index + 1}/"
-                    f"{len(images)} "
-                    f"{image_path}"
-                )
-
-                show_image(
-                    screen,
-                    image_path
-                )
-
-                current_index = (
-                    current_index + 1
-                ) % len(images)
-
-                last_change = now
-
-        else:
-
-            # No images available.
+        if not images:
             screen.fill((0, 0, 0))
-
             pygame.display.flip()
+            clock.tick(10)
+            continue
 
-            last_change = time.monotonic()
+        if current_index >= len(images):
+            current_index = 0
 
-        clock.tick(10)
+        poster = images[current_index]
+        poster_id = poster["posterId"]
+        image_path = poster["file"]
+        started_at = datetime.now(timezone.utc)
 
-    # --------------------------------------------------------
-    # Shutdown
-    # --------------------------------------------------------
+        print(f"[DISPLAY] {current_index + 1}/{len(images)} posterId={poster_id}")
+        displayed = show_image(screen, image_path)
 
-    print("Stopping slideshow...")
+        if displayed:
+            end_time = time.monotonic() + SLIDE_DELAY
+            while running and time.monotonic() < end_time:
+                for event in pygame.event.get():
+                    if event.type == pygame.QUIT or (
+                        event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE
+                    ):
+                        running = False
+                clock.tick(20)
+
+            duration_ms = int((datetime.now(timezone.utc) - started_at).total_seconds() * 1000)
+            event = {
+                "eventId": str(uuid.uuid4()),
+                "posterId": poster_id,
+                "startedAt": utc_iso(started_at),
+                "durationMs": duration_ms
+            }
+            print(f"[ANALYTICS] Queue posterId={poster_id} durationMs={duration_ms}")
+            enqueue_analytics(event)
+
+        current_index = (current_index + 1) % len(images)
 
     stop_event.set()
-
-    sync_thread.join(timeout=2)
-
     pygame.quit()
 
-
 if __name__ == "__main__":
-
     try:
         main()
-
     except KeyboardInterrupt:
-
-        print("\nInterrupted")
-
         stop_event.set()
-
         pygame.quit()
